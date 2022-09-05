@@ -4,8 +4,6 @@
 package tests
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -20,7 +18,6 @@ import (
 	"github.com/bytebase/bytebase/common/log"
 	"github.com/bytebase/bytebase/plugin/db"
 	resourcemysql "github.com/bytebase/bytebase/resources/mysql"
-	"github.com/bytebase/bytebase/resources/mysqlutil"
 	"github.com/bytebase/bytebase/tests/fake"
 
 	"go.uber.org/zap"
@@ -28,130 +25,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestBackupRestoreBasic tests basic backup and restore behavior
-// The test plan is:
-// TODO(dragonly): add routine/event/trigger
-// 1. create schema with index and constraint and populate data
-// 2. create a full backup
-// 3. clear data
-// 4. restore data
-// 5. validate.
-func TestBackupRestoreBasic(t *testing.T) {
-	t.Parallel()
-	a := require.New(t)
-	ctx := context.Background()
-
-	port := getTestPort(t.Name())
-	database := "backup_restore"
-	table := "backup_restore"
-
-	resourceDir := t.TempDir()
-	err := mysqlutil.Install(resourceDir)
-	a.NoError(err)
-
-	_, stop := resourcemysql.SetupTestInstance(t, port)
-	defer stop()
-
-	db, err := connectTestMySQL(port, "")
-	a.NoError(err)
-	defer db.Close()
-
-	_, err = db.Exec(fmt.Sprintf(`
-	CREATE DATABASE %s;
-	USE %s;
-	CREATE TABLE %s (
-		id INT,
-		PRIMARY KEY (id),
-		CHECK (id >= 0)
-	);
-	CREATE VIEW v_%s AS SELECT * FROM %s;
-	`, database, database, table, table, table))
-	a.NoError(err)
-
-	const numRecords = 10
-	tx, err := db.Begin()
-	a.NoError(err)
-	for i := 0; i < numRecords; i++ {
-		_, err = tx.Exec(fmt.Sprintf("INSERT INTO %s VALUES (%d)", table, i))
-		a.NoError(err)
-	}
-	err = tx.Commit()
-	a.NoError(err)
-
-	// make a full backup
-	driver, err := getTestMySQLDriver(ctx, t, strconv.Itoa(port), database, resourceDir)
-	a.NoError(err)
-	defer driver.Close(ctx)
-
-	buf, _, err := doBackup(ctx, driver, database)
-	a.NoError(err)
-	log.Debug("backup content", zap.String("content", buf.String()))
-
-	// drop all tables and views
-	_, err = db.Exec(fmt.Sprintf("DROP TABLE %s; DROP VIEW v_%s;", table, table))
-	a.NoError(err)
-
-	// restore
-	err = driver.Restore(ctx, bufio.NewReader(buf))
-	a.NoError(err)
-
-	// validate data
-	tableAllRows, err := db.Query(fmt.Sprintf("SELECT * FROM %s ORDER BY id ASC", table))
-	a.NoError(err)
-	defer tableAllRows.Close()
-	i := 0
-	for tableAllRows.Next() {
-		var col int
-		a.NoError(tableAllRows.Scan(&col))
-		a.Equal(i, col)
-		i++
-	}
-	a.NoError(tableAllRows.Err())
-	a.Equal(numRecords, i)
-}
-
 const (
 	numRowsTime0 = 10
 	numRowsTime1 = 20
 	numRowsTime2 = 30
 )
 
-func TestPITRBuggyApplication(t *testing.T) {
-	t.Parallel()
-	a := require.New(t)
-	ctx := context.Background()
-	port := getTestPort(t.Name())
-	ctl := &controller{}
-	project, mysqlDB, database, cleanFn := setUpForPITRTest(ctx, t, ctl, port)
-	defer cleanFn()
-
-	insertRangeData(t, mysqlDB, numRowsTime0, numRowsTime1)
-
-	ctxUpdateRow, cancelUpdateRow := context.WithCancel(ctx)
-	targetTs := startUpdateRow(ctxUpdateRow, t, database.Name, port) + 1
-	issue, err := createPITRIssue(ctl, project, database, targetTs)
-	a.NoError(err)
-
-	// Restore stage.
-	status, err := ctl.waitIssueNextTaskWithTaskApproval(issue.ID)
-	a.NoError(err)
-	a.Equal(api.TaskDone, status)
-
-	cancelUpdateRow()
-	// We mimics the situation where the user waits for the target database idle before doing the cutover.
-	time.Sleep(time.Second)
-
-	// Cutover stage.
-	status, err = ctl.waitIssueNextTaskWithTaskApproval(issue.ID)
-	a.NoError(err)
-	a.Equal(api.TaskDone, status)
-
-	validateTbl0(t, mysqlDB, database.Name, numRowsTime1)
-	validateTbl1(t, mysqlDB, database.Name, numRowsTime1)
-	validateTableUpdateRow(t, mysqlDB, database.Name)
-}
-
-func TestPITRSchemaMigrationFailure(t *testing.T) {
+// TestPITRGeneral tests for the general PITR cases:
+// 1. buggy application.
+// 2. bad schema migration.
+func TestPITRGeneral(t *testing.T) {
 	t.Parallel()
 	a := require.New(t)
 	ctx := context.Background()
@@ -617,19 +500,6 @@ func validateTableUpdateRow(t *testing.T, db *sql.DB, databaseName string) {
 	a.Equal(false, rows.Next())
 
 	a.NoError(rows.Err())
-}
-
-func doBackup(ctx context.Context, driver db.Driver, database string) (*bytes.Buffer, *api.BackupPayload, error) {
-	var buf bytes.Buffer
-	var backupPayload api.BackupPayload
-	backupPayloadString, err := driver.Dump(ctx, database, &buf, false)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := json.Unmarshal([]byte(backupPayloadString), &backupPayload); err != nil {
-		return nil, nil, err
-	}
-	return &buf, &backupPayload, nil
 }
 
 // Concurrently update a single row to mimic the ongoing business workload.
